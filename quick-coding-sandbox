@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOL_NAME="quick-coding-sandbox"
+TOOL_DESC="Userspace-only coding environment with AI tools"
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLS_DIR="${SCRIPT_DIR}/tools"
+if [[ ! -d "$TOOLS_DIR" ]]; then
+    TOOLS_DIR="/usr/share/coding-sandbox/tools"
+fi
+
+get_version() {
+    local script_dir
+    script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    local ver
+    ver=$(git -C "${script_dir}" describe --tags --always 2>/dev/null) || true
+    if [[ -n "$ver" ]]; then
+        echo "${ver#v}"
+        return
+    fi
+    echo "${CODING_SANDBOX_VERSION:-dev}"
+}
+
+QUICK_CSB_DIR="${QUICK_CSB_DIR:-$HOME/.quick-coding-sandbox}"
+QUICK_CSB_HOME="${QUICK_CSB_DIR}/home"
+QUICK_CSB_USR_LOCAL="${QUICK_CSB_DIR}/usr-local"
+QUICK_CSB_TOOLS="${QUICK_CSB_USR_LOCAL}/bin"
+CONTAINER_USER="sandbox"
+CONTAINER_UID=1000
+CONTAINER_GID=1000
+CONTAINER_HOME="/home/${CONTAINER_USER}"
+
+# Container name — script-level so cleanup trap can access it
+container_name=""
+
+# Logging functions
+info() { echo "INFO: $*"; }
+warn() { echo "WARN: $*" >&2; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+success() { echo "SUCCESS: $*"; }
+
+check_prereqs() {
+    command -v incus &>/dev/null || die "incus not found. Install: https://linuxcontainers.org/incus/docs/main/installing/"
+    incus list &>/dev/null || die "Incus not initialized. Run 'incus init' first."
+    command -v gpg &>/dev/null || warn "gpg not found — tool download GPG verification will be skipped"
+}
+
+cmd_shell() {
+    check_prereqs
+
+    # Check if tools installed
+    if [[ ! -d "${QUICK_CSB_TOOLS}" ]] || [[ -z "$(ls -A "${QUICK_CSB_TOOLS}" 2>/dev/null)" ]]; then
+        warn "No tools installed. Run '$(basename "$0") setup' first."
+        read -r -p "Run setup now? [Y/n] " REPLY
+        if [[ ! ${REPLY:-Y} =~ ^[Nn]$ ]]; then
+            cmd_setup
+        else
+            die "Cannot launch shell without tools."
+        fi
+    fi
+
+    # Create directories if needed
+    mkdir -p "${QUICK_CSB_HOME}" "${QUICK_CSB_TOOLS}"
+    chmod 700 "${QUICK_CSB_DIR}"
+
+    # Warn if PWD is on a remote filesystem
+    local fs_type
+    fs_type=$(stat -f -c %T "$PWD" 2>/dev/null) || true
+    case "$fs_type" in
+        nfs|fuse*|cifs|smb*)
+            warn "Working directory is on a ${fs_type} filesystem — container mount may not work reliably." ;;
+    esac
+
+    local dir_hash dir_base dir_slug
+    dir_hash=$(printf '%s' "$PWD" | md5sum)
+    dir_hash="${dir_hash:0:6}"
+    dir_base="${PWD##*/}"
+    dir_base="${dir_base,,}"
+    dir_base="${dir_base//[^a-z0-9]/-}"
+    dir_base="${dir_base:0:40}"
+    dir_slug="${dir_base}-${dir_hash}"
+    container_name="qcs-${dir_slug}"
+    local mount_path="${CONTAINER_HOME}/${dir_slug}"
+
+    if incus info "$container_name" &>/dev/null; then
+        die "A quick-sandbox container (${container_name}) is already running for this directory."
+    fi
+
+    cleanup() {
+        [[ -n "${container_name}" ]] && incus delete --force "${container_name}" 2>/dev/null || true
+        # Remove empty mountpoint directory from persistent home
+        rmdir "${QUICK_CSB_HOME}/${dir_slug}" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    info "Starting ephemeral container..."
+
+    incus init "images:debian/trixie" "${container_name}" \
+        -c security.nesting=true \
+        --ephemeral \
+        < /dev/null
+
+    incus config device add "${container_name}" home disk \
+        source="${QUICK_CSB_HOME}" path="${CONTAINER_HOME}" shift=true
+    incus config device add "${container_name}" tools disk \
+        source="${QUICK_CSB_USR_LOCAL}" path=/usr/local shift=true
+    incus config device add "${container_name}" workspace disk \
+        source="${PWD}" path="${mount_path}" shift=true
+
+    # Try start with shift=true; fall back to raw.idmap if blocked (Incus 6.0.x
+    # restricted projects); die with guidance if both fail.
+    if ! incus start "${container_name}" 2>/dev/null; then
+        warn "shift=true blocked — trying raw.idmap fallback..."
+        incus delete --force "${container_name}"
+        incus init "images:debian/trixie" "${container_name}" \
+            -c security.nesting=true \
+            --ephemeral \
+            < /dev/null
+        incus config device add "${container_name}" home disk \
+            source="${QUICK_CSB_HOME}" path="${CONTAINER_HOME}"
+        incus config device add "${container_name}" tools disk \
+            source="${QUICK_CSB_USR_LOCAL}" path=/usr/local
+        incus config device add "${container_name}" workspace disk \
+            source="${PWD}" path="${mount_path}"
+        incus config set "${container_name}" raw.idmap="$(printf 'uid %d %d\ngid %d %d' \
+            "$(id -u)" "${CONTAINER_UID}" "$(id -g)" "${CONTAINER_GID}")"
+        if ! incus start "${container_name}" 2>/dev/null; then
+            die "Container start failed — UID mapping not available in this Incus project.
+
+  An admin needs to configure UID mapping for this Incus project.
+  See README.md section 'Incus 6.0.x UID Mapping' for the exact commands."
+        fi
+    fi
+
+    # Create sandbox user inside container
+    incus exec "${container_name}" -- useradd --no-create-home -u "${CONTAINER_UID}" -s /bin/bash "${CONTAINER_USER}"
+    incus exec "${container_name}" -- bash -c \
+        "echo '${CONTAINER_USER} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/${CONTAINER_USER}"
+
+    # Version marker (same path as coding-sandbox images: /etc/coding-sandbox-version)
+    local version
+    version=$(get_version)
+    incus exec "${container_name}" -- bash -c 'printf "%s\n" "$1" > /etc/coding-sandbox-version' _ "${version}"
+
+    # Port forwarding (localhost-only)
+    if [[ -n "${CODING_SANDBOX_PORTS:-}" ]]; then
+        local port
+        for port in ${CODING_SANDBOX_PORTS}; do
+            if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                die "Invalid port: ${port} (must be 1-65535)"
+            fi
+            incus config device add "${container_name}" "proxy${port}" proxy \
+                "listen=tcp:127.0.0.1:${port}" "connect=tcp:127.0.0.1:${port}"
+        done
+        info "Port forwarding: ${CODING_SANDBOX_PORTS}"
+    fi
+
+    # Read version cache for banner display (no network calls)
+    local -A cached_versions=()
+    local version_cache="${QUICK_CSB_DIR}/version-cache"
+    if [[ -f "$version_cache" ]]; then
+        while IFS='=' read -r key value; do
+            [[ -n "$key" ]] && cached_versions["$key"]="$value"
+        done < "$version_cache"
+    fi
+
+    # Show welcome message
+    local tool_name tool_ver_display
+    echo ""
+    echo "╔════════════════════════════════════════╗"
+    echo "║   Quick Coding Sandbox (Debian 13)     ║"
+    echo "║                                        ║"
+    printf "║   %-37s║\n" "Verfügbare Tools:"
+    for tool in "${QUICK_CSB_TOOLS}"/*; do
+        if [[ -x "$tool" ]]; then
+            tool_name="$(basename "$tool")"
+            # Try to get installed version from tool
+            local installed_ver=""
+            installed_ver=$("$tool" --version 2>/dev/null | head -1) || installed_ver=""
+            tool_ver_display="${tool_name}"
+            if [[ -n "$installed_ver" ]]; then
+                local cached_latest="${cached_versions[${tool_name}]:-}"
+                if [[ -n "$cached_latest" && "$installed_ver" != "$cached_latest" ]]; then
+                    tool_ver_display="${tool_name}  v${installed_ver} ↑"
+                elif [[ -n "$cached_latest" ]]; then
+                    tool_ver_display="${tool_name}  v${installed_ver} ✓"
+                else
+                    tool_ver_display="${tool_name}  v${installed_ver}"
+                fi
+            fi
+            printf "║   • %-35s║\n" "${tool_ver_display}"
+        fi
+    done
+    echo "║                                        ║"
+    echo "╚════════════════════════════════════════╝"
+    echo ""
+
+    # Launch shell as sandbox user
+    incus exec "${container_name}" --user "${CONTAINER_UID}" --group "${CONTAINER_GID}" \
+        --cwd "${mount_path}" --env "HOME=${CONTAINER_HOME}" -- /bin/bash -l
+
+    info "Container stopped (ephemeral — auto-deleted)."
+}
+
+cmd_help() {
+    cat <<EOF
+${TOOL_NAME} — ${TOOL_DESC}
+
+Usage: ${TOOL_NAME} [command]
+
+Commands:
+  shell       Interactive shell (default)
+  setup       Re-run tool selection and installation
+  status      Show status and directory location
+  help        Show this help
+EOF
+}
+
+cmd_setup() {
+    info "Quick Coding Sandbox Setup"
+    echo ""
+
+    # Create directories
+    mkdir -p "${QUICK_CSB_HOME}" "${QUICK_CSB_TOOLS}"
+    chmod 700 "${QUICK_CSB_DIR}"
+
+    # Check if tools directory exists
+    if [[ ! -d "${TOOLS_DIR}" ]]; then
+        die "Tools directory not found: ${TOOLS_DIR}"
+    fi
+
+    # Discover available tools and check installed status
+    local -a available_tools=()
+    local -a tool_labels=()
+    local idx=0
+
+    for tool_script in "${TOOLS_DIR}"/*; do
+        [[ -x "$tool_script" ]] || continue
+        local tname tline installed_marker
+        tname=$(basename "$tool_script")
+        tline=$("$tool_script" 2>/dev/null | head -1) || tline="$tname"
+        installed_marker=""
+        if [[ -x "${QUICK_CSB_TOOLS}/${tname}" ]] || ls "${QUICK_CSB_TOOLS}/${tname}"* &>/dev/null; then
+            # Call version-check for installed tools
+            local installed_ver="" latest_ver=""
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    installed) installed_ver="$value" ;;
+                    latest)    latest_ver="$value" ;;
+                esac
+            done < <("${tool_script}" "${QUICK_CSB_TOOLS}" version-check 2>/dev/null || true)
+
+            if [[ "$installed_ver" == "none" || -z "$installed_ver" ]]; then
+                installed_marker=" [installed]"
+            elif [[ "$latest_ver" == "unknown" || "$latest_ver" == "n/a" ]]; then
+                installed_marker=" [installed: ${installed_ver} ?]"
+            elif [[ "$installed_ver" == "$latest_ver" ]]; then
+                installed_marker=" [installed: ${installed_ver} ✓]"
+            else
+                installed_marker=" [installed: ${installed_ver} → ${latest_ver} ↑]"
+            fi
+        fi
+        available_tools+=("$tname")
+        tool_labels+=("$tline$installed_marker")
+        ((idx++)) || true
+    done
+
+    if [[ ${#available_tools[@]} -eq 0 ]]; then
+        die "No tool scripts found in ${TOOLS_DIR}"
+    fi
+
+    echo "Available tools:"
+    for i in "${!available_tools[@]}"; do
+        printf "  %d) %s\n" "$((i + 1))" "${tool_labels[$i]}"
+    done
+    echo ""
+    echo "Install (space-separated numbers, 'all', or 'q' to quit)"
+    read -r -p "Choice: " choice
+
+    [[ "$choice" == "q" ]] && { info "Setup cancelled."; return 0; }
+
+    local -a selected_tools=()
+    if [[ "$choice" == "all" ]]; then
+        selected_tools=("${available_tools[@]}")
+    else
+        for num in $choice; do
+            if ! [[ "$num" =~ ^[0-9]+$ ]] || (( num < 1 || num > ${#available_tools[@]} )); then
+                warn "Invalid selection: $num — skipping"
+                continue
+            fi
+            selected_tools+=("${available_tools[$((num - 1))]}")
+        done
+    fi
+
+    if [[ ${#selected_tools[@]} -eq 0 ]]; then
+        warn "No tools selected."
+        return 0
+    fi
+
+    # Install selected tools
+    for tool in "${selected_tools[@]}"; do
+        if [[ ! -x "${TOOLS_DIR}/${tool}" ]]; then
+            warn "Tool script not found or not executable: ${TOOLS_DIR}/${tool}"
+            continue
+        fi
+        # Run uninstaller first if tool already installed (clean update)
+        local uninstaller="${QUICK_CSB_USR_LOCAL}/lib/uninstallers/${tool}"
+        if [[ -x "$uninstaller" ]]; then
+            info "Uninstalling ${tool} (clean update)..."
+            "$uninstaller"
+        fi
+        info "Installing ${tool}..."
+        bash "${TOOLS_DIR}/${tool}" "${QUICK_CSB_TOOLS}"
+    done
+
+    # Write version cache for welcome banner
+    local version_cache="${QUICK_CSB_DIR}/version-cache"
+    : > "$version_cache"  # truncate
+    for tool in "${selected_tools[@]}"; do
+        local vc_latest=""
+        while IFS='=' read -r key value; do
+            case "$key" in
+                latest) vc_latest="$value" ;;
+            esac
+        done < <("${TOOLS_DIR}/${tool}" "${QUICK_CSB_TOOLS}" version-check 2>/dev/null || true)
+        if [[ -n "$vc_latest" && "$vc_latest" != "unknown" && "$vc_latest" != "n/a" ]]; then
+            echo "${tool}=${vc_latest}" >> "$version_cache"
+        fi
+    done
+
+    # Save config
+    echo "${selected_tools[*]}" > "${QUICK_CSB_DIR}/config"
+
+    success "Setup complete!"
+}
+
+cmd_status() {
+    echo "=== Quick Coding Sandbox ==="
+    echo ""
+    echo "Config:    ${QUICK_CSB_DIR}/"
+    echo "Home:      ${QUICK_CSB_HOME}/"
+    echo "usr-local: ${QUICK_CSB_USR_LOCAL}/"
+    echo "Tools:     ${QUICK_CSB_TOOLS}/"
+    echo ""
+    echo "Installed tools:"
+    if [[ -d "${QUICK_CSB_TOOLS}" ]]; then
+        ls -1 "${QUICK_CSB_TOOLS}" 2>/dev/null | sed 's/^/  - /' || echo "  (none)"
+    else
+        echo "  (none - run 'setup' first)"
+    fi
+}
+
+cmd_version() {
+    get_version
+}
+
+cmd="${1:-shell}"
+case "$cmd" in
+    --version) cmd_version ;;
+    shell|setup|status|version|help) "cmd_${cmd}" ;;
+    *) die "Unknown command: $cmd" ;;
+esac

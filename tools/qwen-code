@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOL_NAME="qwen-code"
+TOOL_DESC="AI coding assistant (QwenLM/qwen-code)"
+
+if [[ $# -eq 0 ]]; then
+    echo "${TOOL_NAME} — ${TOOL_DESC}"
+    echo "Usage: $0 <target-dir>"
+    exit 0
+fi
+
+target="$1"
+[[ -d "$target" ]] || { echo "Error: target directory does not exist: $target" >&2; exit 1; }
+
+NODE_VERSION="22"
+NODE_DIR="${target}/../lib/qwen-code"
+
+if [[ "${2:-}" == "version-check" ]]; then
+    installed_ver="none"
+    latest_ver="unknown"
+    if [[ -x "${NODE_DIR}/bin/qwen" ]]; then
+        installed_ver=$("${NODE_DIR}/bin/node" "${NODE_DIR}/bin/qwen" --version 2>/dev/null | head -1) || installed_ver="none"
+    fi
+    latest_ver=$(curl -fsSL "https://registry.npmjs.org/@qwen-code/qwen-code/latest" 2>/dev/null \
+        | grep -oE '"version":"[^"]+"' | head -1 | cut -d'"' -f4) || latest_ver="unknown"
+    echo "installed=${installed_ver}"
+    echo "latest=${latest_ver:-unknown}"
+    exit 0
+fi
+
+case "$(uname -m)" in
+    x86_64)  node_arch="x64" ;;
+    aarch64) node_arch="arm64" ;;
+    *)
+        echo "ERROR: qwen-code requires x86_64 or aarch64 — $(uname -m) is not supported" >&2
+        exit 1
+        ;;
+esac
+
+echo "Installing ${TOOL_NAME} to ${target}"
+
+# Node.js release signing key fingerprints (https://github.com/nodejs/node#release-keys)
+NODE_KEYS=(
+    5BE8A3F6C8A5C01D106C0AD820B1A390B168D356  # Antoine du Hamel
+    DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7  # Juan José Arboleda
+    CC68F5A3106FF448322E48ED27F5E38D5B0A215F  # Marco Ippolito
+    8FCCA13FEF1D0C2E91008E09770F7A9A5AE15600  # Michaël Zasso
+    890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4  # Rafael Gonzaga
+    C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C  # Richard Lau
+    108F52B48DB57BB0CC439B2997B01419BD92F80A  # Ruy Adorno
+    A363A499291CBBC940DD62E41F10027AF002F8B0  # Ulises Gascón
+)
+
+# Install standalone Node.js if not present in target
+mkdir -p "${NODE_DIR}"
+if [[ ! -x "${NODE_DIR}/bin/node" ]]; then
+    echo "  Resolving latest Node.js ${NODE_VERSION}.x tarball..."
+    node_base_url="https://nodejs.org/dist/latest-v${NODE_VERSION}.x"
+    node_tarball=$(curl -fsSL "${node_base_url}/" \
+        | grep -oE "node-v[0-9]+\.[0-9]+\.[0-9]+-linux-${node_arch}\.tar\.xz" | head -1)
+    [[ -n "$node_tarball" ]] || { echo "Error: could not find Node.js ${NODE_VERSION}.x tarball" >&2; exit 1; }
+
+    # Download tarball + verification files to tmpdir
+    tmpdir=$(mktemp -d)
+    echo "  Downloading ${node_tarball}..."
+    curl -fsSL "${node_base_url}/${node_tarball}" -o "${tmpdir}/${node_tarball}"
+    curl -fsSL "${node_base_url}/SHASUMS256.txt" -o "${tmpdir}/SHASUMS256.txt" || true
+    curl -fsSL "${node_base_url}/SHASUMS256.txt.asc" -o "${tmpdir}/SHASUMS256.txt.asc" || true
+
+    gpg_verified=false
+    sha_verified=false
+
+    # GPG signature verification
+    if [[ -s "${tmpdir}/SHASUMS256.txt.asc" ]] && [[ -s "${tmpdir}/SHASUMS256.txt" ]]; then
+        if command -v gpg &>/dev/null; then
+            gpg_home=$(mktemp -d "${tmpdir}/gnupg.XXXXXX")
+            chmod 700 "${gpg_home}"
+            key_imported=false
+            for key in "${NODE_KEYS[@]}"; do
+                if gpg --homedir "${gpg_home}" --batch --keyserver hkps://keys.openpgp.org \
+                    --recv-keys "${key}" 2>/dev/null; then
+                    key_imported=true
+                fi
+            done
+            if [[ "$key_imported" == "true" ]]; then
+                # Node.js .asc is a cleartext signature — verify with single file
+                if gpg --homedir "${gpg_home}" --batch --verify \
+                    "${tmpdir}/SHASUMS256.txt.asc" 2>/dev/null; then
+                    echo "  GPG signature verified"
+                    gpg_verified=true
+                else
+                    echo "ERROR: GPG signature verification FAILED for SHASUMS256.txt — aborting" >&2
+                    rm -rf "${tmpdir}"
+                    exit 1
+                fi
+            else
+                echo "WARN: qwen-code: could not import Node.js release keys — GPG verification unavailable" >&2
+            fi
+        else
+            echo "WARN: qwen-code: gpg not found — GPG verification unavailable" >&2
+        fi
+    else
+        echo "WARN: qwen-code: SHASUMS256.txt or .asc not available — GPG verification unavailable" >&2
+    fi
+
+    # SHA256 checksum verification
+    if [[ -s "${tmpdir}/SHASUMS256.txt" ]]; then
+        expected_sha=$(awk -v f="${node_tarball}" '$2 == f {print $1}' "${tmpdir}/SHASUMS256.txt")
+        if [[ -n "$expected_sha" ]]; then
+            actual_sha=$(sha256sum "${tmpdir}/${node_tarball}" | awk '{print $1}')
+            if [[ "$actual_sha" == "$expected_sha" ]]; then
+                echo "  SHA256 checksum verified"
+                sha_verified=true
+            else
+                echo "ERROR: SHA256 mismatch for ${node_tarball} — aborting" >&2
+                echo "  expected: ${expected_sha}" >&2
+                echo "  actual:   ${actual_sha}" >&2
+                rm -rf "${tmpdir}"
+                exit 1
+            fi
+        fi
+    fi
+
+    # If neither verification succeeded, prompt or abort
+    if [[ "$gpg_verified" == "false" ]] && [[ "$sha_verified" == "false" ]]; then
+        if [[ -t 0 ]]; then
+            read -r -p "  No verification available. Continue without verification? [y/N] " reply
+            if [[ ! "${reply:-N}" =~ ^[Yy]$ ]]; then
+                rm -rf "${tmpdir}"
+                exit 1
+            fi
+        else
+            echo "ERROR: qwen-code: no verification available and running non-interactively — aborting" >&2
+            rm -rf "${tmpdir}"
+            exit 1
+        fi
+    fi
+
+    # Extract verified tarball
+    tar -xJf "${tmpdir}/${node_tarball}" --strip-components=1 -C "${NODE_DIR}"
+    rm -rf "${tmpdir}"
+fi
+
+# Install qwen-code via npm
+echo "  Installing @qwen-code/qwen-code..."
+"${NODE_DIR}/bin/node" "${NODE_DIR}/bin/npm" install -g --prefix="${NODE_DIR}" @qwen-code/qwen-code@latest 2>&1
+
+# Generate wrapper script
+cat > "${target}/qwen" <<WRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+NODE_DIR="\$(dirname "\$(readlink -f "\$0")")/../lib/qwen-code"
+export PATH="\${NODE_DIR}/bin:\${PATH}"
+exec "\${NODE_DIR}/bin/qwen" "\$@"
+WRAPPER
+chmod +x "${target}/qwen"
+
+# Generate uninstaller
+uninstaller="${target}/../lib/uninstallers/${TOOL_NAME}"
+mkdir -p "$(dirname "$uninstaller")"
+cat > "$uninstaller" <<UNINSTALL
+#!/usr/bin/env bash
+# Uninstaller for ${TOOL_NAME} — generated by tools/${TOOL_NAME}
+rm -f "${target}/qwen"
+rm -rf "${target}/../lib/qwen-code"
+rm -f "\$(dirname "\$0")/${TOOL_NAME}"
+UNINSTALL
+chmod +x "$uninstaller"
+
+# Configure Qwen Code to use AGENTS.md
+QWEN_CONFIG_DIR="${HOME}/.qwen"
+QWEN_CONFIG_FILE="${QWEN_CONFIG_DIR}/settings.json"
+mkdir -p "${QWEN_CONFIG_DIR}"
+chmod 700 "${QWEN_CONFIG_DIR}"
+
+if [[ -f "${QWEN_CONFIG_FILE}" ]]; then
+    if grep -q '"contextFileName"[[:space:]]*:[[:space:]]*"AGENTS.md"' "${QWEN_CONFIG_FILE}" 2>/dev/null; then
+        echo "  Qwen Code already configured for AGENTS.md"
+    elif grep -q '"contextFileName"' "${QWEN_CONFIG_FILE}" 2>/dev/null; then
+        echo "  WARN: Custom contextFileName in use — not modifying"
+    else
+        # Add contextFileName to existing config
+        tmpfile=$(mktemp)
+        sed '$ s/}$/,\n  "contextFileName": "AGENTS.md"\n}/' "${QWEN_CONFIG_FILE}" > "${tmpfile}"
+        mv "${tmpfile}" "${QWEN_CONFIG_FILE}"
+        chmod 600 "${QWEN_CONFIG_FILE}"
+        echo "  Added contextFileName: AGENTS.md"
+    fi
+else
+    cat > "${QWEN_CONFIG_FILE}" <<SETTINGS
+{
+  "contextFileName": "AGENTS.md"
+}
+SETTINGS
+    chmod 600 "${QWEN_CONFIG_FILE}"
+    echo "  Created config with contextFileName: AGENTS.md"
+fi
+
+echo "  ${TOOL_NAME} installed successfully."

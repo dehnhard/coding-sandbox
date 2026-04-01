@@ -1,0 +1,1702 @@
+#!/usr/bin/env bash
+# coding-sandbox — Incus sandbox for AI coding tools (Debian 13)
+#
+# Usage:
+#   coding-sandbox [command] [--vm]
+#
+# Container mode (default): ephemeral container mounting $PWD from host
+# VM mode (--vm): persistent VM where you check out projects inside
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLS_DIR="${SCRIPT_DIR}/tools"
+if [[ ! -d "$TOOLS_DIR" ]]; then
+    TOOLS_DIR="/usr/share/coding-sandbox/tools"
+fi
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+case "$(uname -m)" in
+    x86_64)  DEB_ARCH="amd64" ;;
+    aarch64) DEB_ARCH="arm64" ;;
+    *)       echo -e "${YELLOW:-}[sandbox]${RESET:-} Untested architecture: $(uname -m). Build may fail." >&2
+             DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" ;;
+esac
+
+case "$DEB_ARCH" in
+    amd64) GRUB_TARGET="x86_64-efi" ;;
+    arm64) GRUB_TARGET="aarch64-efi" ;;
+    *)     GRUB_TARGET="x86_64-efi" ;;  # fallback
+esac
+
+# ── Version ──────────────────────────────────────────────────────────────────
+get_version() {
+    local ver
+    ver=$(git -C "${SCRIPT_DIR}" describe --tags --always 2>/dev/null) || true
+    if [[ -n "$ver" ]]; then
+        echo "${ver#v}"
+        return
+    fi
+    echo "${CODING_SANDBOX_VERSION:-dev}"
+}
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+VM_NAME="${CODING_SANDBOX_VM:-coding-sandbox}"
+IMAGE_ALIAS="${CODING_SANDBOX_IMAGE:-coding-sandbox/debian-13}"
+CONTAINER_IMAGE_ALIAS="${CODING_SANDBOX_CONTAINER_IMAGE:-coding-sandbox/debian-13/container}"
+# Under sudo, $HOME is /root — resolve the invoking user's real home
+# so all user-facing paths (build cache, credentials) stay accessible
+if [[ -n "${SUDO_USER:-}" && "$(id -u)" -eq 0 ]]; then
+    _REAL_HOME=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+else
+    _REAL_HOME="${HOME}"
+fi
+if [[ "$(readlink -f "${BASH_SOURCE[0]}")" == /usr/bin/* ]]; then
+    BUILD_DIR="${CODING_SANDBOX_BUILDDIR:-/var/cache/coding-sandbox}"
+else
+    BUILD_DIR="${CODING_SANDBOX_BUILDDIR:-${_REAL_HOME}/.cache/coding-sandbox}"
+fi
+SHELL_USER="${CODING_SANDBOX_USER:-sandbox}"
+VM_CPU="${CODING_SANDBOX_CPU:-1}"
+VM_RAM="${CODING_SANDBOX_RAM:-2GiB}"
+VM_DISK="${CODING_SANDBOX_DISK:-20GiB}"
+HOST_HOME="${CODING_SANDBOX_HOME:-${_REAL_HOME}/.coding-sandbox/home}"
+if [[ -z "${CODING_SANDBOX_TOOLS:-}" ]]; then
+    CODING_SANDBOX_TOOLS=""
+    for _t in "${TOOLS_DIR}"/*; do
+        [[ -x "$_t" ]] && CODING_SANDBOX_TOOLS+="$(basename "$_t") "
+    done
+    unset _t
+fi
+CODING_SANDBOX_PORTS="${CODING_SANDBOX_PORTS:-}"
+CONTAINER_UID=1000
+CONTAINER_GID=1000
+CONTAINER_HOME="/home/${SHELL_USER}"
+CONTAINER_PREFIX="cs"
+MODE="container"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+
+info()    { echo -e "${CYAN}[sandbox]${RESET} $*"; }
+success() { echo -e "${GREEN}[sandbox]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[sandbox]${RESET} $*"; }
+die()     { echo -e "${RED}[sandbox] ERROR:${RESET} $*" >&2; exit 1; }
+
+
+# ── Prerequisite checks ──────────────────────────────────────────────────────
+check_deps() {
+    local cmd="$1"
+
+    # ── Architecture check ─────────────────────────────────────────
+    local host_arch
+    host_arch=$(uname -m)
+    if [[ "$host_arch" != "x86_64" ]]; then
+        warn "Untested architecture: ${host_arch}. Things may not work as expected."
+    fi
+
+    # ── Incus presence check ────────────────────────────────────────
+    command -v incus &>/dev/null \
+        || die "incus not found.\n  Install Incus: https://linuxcontainers.org/incus/docs/main/installing/"
+    local incus_check_err incus_check_rc
+    incus_check_err=$(incus list 2>&1 >/dev/null) && incus_check_rc=0 || incus_check_rc=$?
+    if (( incus_check_rc != 0 )); then
+        if echo "$incus_check_err" | grep -qi "permission"; then
+            die "Cannot access Incus socket (permission denied).\n  Add yourself to the incus group:\n    sudo usermod -aG incus \$(whoami)\n  Then log out and back in."
+        else
+            die "Incus is not initialized.\n  Run 'incus admin init --minimal' to set up Incus, then try again."
+        fi
+    fi
+
+    # ── Incus version check ─────────────────────────────────────────
+    local incus_version incus_major
+    incus_version=$(incus version 2>/dev/null | awk '/^Client version:/{v=$3} END{print v}' | tr -d '\n\r')
+    incus_major=$(echo "${incus_version}" | cut -d. -f1)
+    if [[ -z "$incus_version" || "$incus_version" == "0" || "$incus_major" -lt 5 ]]; then
+        die "Incus version too old: ${incus_version}. Need version 5.0 or newer."
+    fi
+
+    # ── Disk space check ───────────────────────────────────────────
+    local tmp_free
+    if [[ "$cmd" == "build" || "$cmd" == "rebuild" ]]; then
+        mkdir -p "$BUILD_DIR" 2>/dev/null || true
+        tmp_free=$(df -BG "$BUILD_DIR" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G')
+        if [[ -n "$tmp_free" && "$tmp_free" -lt 5 ]]; then
+            die "Insufficient disk space: ${BUILD_DIR} has ${tmp_free}GB free. Need at least 5GB."
+        fi
+    fi
+
+    # ── KVM availability check (VM mode) ──────────────────────────────
+    if [[ "$MODE" == "vm" && "$cmd" != "build" && "$cmd" != "rebuild" ]]; then
+        if [[ ! -e /dev/kvm ]]; then
+            die "KVM not available — VM mode requires hardware virtualization.\n" \
+                "  Check that virtualization is enabled in BIOS/UEFI and the kvm module is loaded."
+        fi
+    fi
+
+    if [[ "$cmd" == "build" || "$cmd" == "rebuild" ]]; then
+        local missing=() tool
+        for tool in distrobuilder debootstrap gpg; do
+            command -v "$tool" &>/dev/null \
+                || [[ -x "/usr/sbin/$tool" ]] \
+                || missing+=("$tool")
+        done
+        if (( ${#missing[@]} )); then
+            die "Missing build tools: ${missing[*]}\n\n" \
+                "  Install distrobuilder: apt install distrobuilder  (or build from source)\n" \
+                "  Install debootstrap:   apt install debootstrap"
+        fi
+    fi
+
+}
+
+# ── Image/instance helpers ───────────────────────────────────────────────────
+image_exists() {
+    incus image show "${IMAGE_ALIAS}" &>/dev/null
+}
+
+container_image_exists() {
+    incus image show "${CONTAINER_IMAGE_ALIAS}" &>/dev/null
+}
+
+# Run a command as the invoking user when called via sudo.
+# Used by ensure_*_image() so rebuild (which runs as root) imports
+# into the invoking user's Incus project.
+_run_as_user() {
+    if [[ -n "${SUDO_USER:-}" && "$(id -u)" -eq 0 ]]; then
+        sudo -u "$SUDO_USER" --set-home "$@"
+    else
+        "$@"
+    fi
+}
+
+image_artifacts_exist() {
+    [[ -f "${BUILD_DIR}/container.incus.tar.xz" \
+    && -f "${BUILD_DIR}/container.rootfs.squashfs" ]]
+}
+
+vm_artifacts_exist() {
+    [[ -f "${BUILD_DIR}/vm.incus.tar.xz" \
+    && -f "${BUILD_DIR}/vm.disk.qcow2" ]]
+}
+
+ensure_container_image() {
+    container_image_exists && return 0
+    if image_artifacts_exist; then
+        info "Importing container image into Incus..."
+        _run_as_user incus image import \
+            "${BUILD_DIR}/container.incus.tar.xz" \
+            "${BUILD_DIR}/container.rootfs.squashfs" \
+            --alias "${CONTAINER_IMAGE_ALIAS}" || true
+        if ! _run_as_user incus image show "${CONTAINER_IMAGE_ALIAS}" &>/dev/null; then
+            warn "Container image import failed."
+            return 1
+        fi
+        local version
+        version=$(cat "${BUILD_DIR}/version" 2>/dev/null) || version="unknown"
+        _run_as_user incus image set-property \
+            "${CONTAINER_IMAGE_ALIAS}" "user.coding-sandbox-version" "${version}" 2>/dev/null || true
+        success "Container image imported."
+        return 0
+    fi
+    return 1
+}
+
+ensure_vm_image() {
+    image_exists && return 0
+    if vm_artifacts_exist; then
+        info "Importing VM image into Incus..."
+        _run_as_user incus image import \
+            "${BUILD_DIR}/vm.incus.tar.xz" \
+            "${BUILD_DIR}/vm.disk.qcow2" \
+            --alias "${IMAGE_ALIAS}" || true
+        if ! _run_as_user incus image show "${IMAGE_ALIAS}" &>/dev/null; then
+            warn "VM image import failed."
+            return 1
+        fi
+        local version
+        version=$(cat "${BUILD_DIR}/version" 2>/dev/null) || version="unknown"
+        _run_as_user incus image set-property \
+            "${IMAGE_ALIAS}" "user.coding-sandbox-version" "${version}" 2>/dev/null || true
+        success "VM image imported."
+        return 0
+    fi
+    return 1
+}
+
+vm_exists() {
+    incus info "${VM_NAME}" &>/dev/null
+}
+
+vm_status() {
+    local status
+    status=$(incus list --format csv | awk -F',' -v name="${VM_NAME}" '$1==name{print $2}')
+    echo "${status:-NOT_FOUND}"
+}
+
+vm_is_running() {
+    [[ "$(vm_status)" == "RUNNING" ]]
+}
+
+wait_for_vm() {
+    local timeout=180 elapsed=0
+    info "Waiting for VM to be reachable..."
+    while (( elapsed < timeout )); do
+        if incus exec "${VM_NAME}" -- true &>/dev/null; then
+            success "VM is reachable (took ${elapsed}s)"
+            return 0
+        fi
+        sleep 2
+        (( elapsed += 2 ))
+        if (( elapsed % 20 == 0 )); then
+            info "Still waiting... (${elapsed}s elapsed)"
+        fi
+    done
+    die "VM did not become reachable within ${timeout}s"
+}
+
+# ── Container helpers ────────────────────────────────────────────────────────
+_DIR_SLUG_CACHE=""
+_dir_slug() {
+    if [[ -n "$_DIR_SLUG_CACHE" ]]; then
+        echo "$_DIR_SLUG_CACHE"
+        return
+    fi
+    local dir_hash dir_base
+    dir_hash=$(printf '%s' "$PWD" | md5sum)
+    dir_hash="${dir_hash:0:6}"
+    dir_base="${PWD##*/}"
+    dir_base="${dir_base,,}"
+    dir_base="${dir_base//[^a-z0-9]/-}"
+    dir_base="${dir_base:0:40}"
+    _DIR_SLUG_CACHE="${dir_base}-${dir_hash}"
+    echo "$_DIR_SLUG_CACHE"
+}
+
+container_name_for_dir() {
+    echo "${CONTAINER_PREFIX}-$(_dir_slug)"
+}
+
+mount_path_for_dir() {
+    echo "${CONTAINER_HOME}/$(_dir_slug)"
+}
+
+# Warn if image version differs from script version
+_check_image_version() {
+    local image_alias="$1"
+    local image_ver script_ver
+    image_ver=$(incus image get-property "${image_alias}" user.coding-sandbox-version 2>/dev/null) || return 0
+    [[ -n "$image_ver" ]] || return 0  # skip check for old images without version
+    script_ver=$(get_version)
+    if [[ "$image_ver" != "$script_ver" ]]; then
+        warn "Image veraltet (${image_ver}, Skript ${script_ver}) — 'sudo $(basename "$0") rebuild' zum Aktualisieren"
+    fi
+}
+
+# Get the current Incus project name
+_incus_project() {
+    incus project list --format csv 2>/dev/null | awk -F',' '$NF ~ /YES/{print $1}' | head -1
+}
+
+# Check if UID mapping workaround is needed for restricted Incus project
+# and offer to configure it. Only runs during build (as root).
+_maybe_configure_uid_mapping() {
+    local project
+    project=$(_incus_project)
+    [[ -n "$project" ]] || return 0  # no project detected
+
+    # Check if already configured
+    local lowlevel
+    lowlevel=$(incus project get "$project" restricted.containers.lowlevel 2>/dev/null) || true
+    [[ "$lowlevel" == "allow" ]] && return 0  # already configured
+
+    # Check if this is a restricted project
+    local restricted
+    restricted=$(incus project get "$project" restricted 2>/dev/null) || true
+    [[ "$restricted" == "true" ]] || return 0  # not restricted, no workaround needed
+
+    info "Incus 6.0.x restricted project '${project}' detected."
+    info "UID mapping workaround needed for containers to work correctly."
+    echo ""
+    echo "  The following commands will be executed:"
+    echo "    incus project set ${project} restricted.containers.lowlevel=allow"
+    echo "    incus project set ${project} restricted.idmap.uid=1000"
+    echo "    incus project set ${project} restricted.idmap.gid=1000"
+    if ! grep -q '^root:1000:1$' /etc/subuid 2>/dev/null; then
+        echo "    echo 'root:1000:1' >> /etc/subuid"
+    fi
+    if ! grep -q '^root:1000:1$' /etc/subgid 2>/dev/null; then
+        echo "    echo 'root:1000:1' >> /etc/subgid"
+    fi
+    echo "    systemctl restart incus"
+    echo ""
+
+    local answer
+    if [[ "${_force_yes:-}" == "true" ]]; then
+        answer="y"
+    else
+        read -r -p "Apply workaround now? [Y/n] " answer
+        answer="${answer:-Y}"
+    fi
+
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        incus project set "$project" restricted.containers.lowlevel=allow
+        incus project set "$project" restricted.idmap.uid=1000
+        incus project set "$project" restricted.idmap.gid=1000
+        if ! grep -q '^root:1000:1$' /etc/subuid 2>/dev/null; then
+            echo 'root:1000:1' >> /etc/subuid
+        fi
+        if ! grep -q '^root:1000:1$' /etc/subgid 2>/dev/null; then
+            echo 'root:1000:1' >> /etc/subgid
+        fi
+        systemctl restart incus
+        success "UID mapping workaround applied."
+    else
+        info "Skipped. Containers may fail to start without this workaround."
+    fi
+}
+
+validate_ports() {
+    local ports="$1"
+    local port
+    for port in ${ports}; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            die "Invalid port: ${port} (must be 1-65535)"
+        fi
+    done
+}
+
+_add_port_forwarding() {
+    local instance="$1"
+    if [[ -n "${CODING_SANDBOX_PORTS}" ]]; then
+        validate_ports "${CODING_SANDBOX_PORTS}"
+        local port port_msg=""
+        for port in ${CODING_SANDBOX_PORTS}; do
+            incus config device add "${instance}" "proxy${port}" proxy \
+                "listen=tcp:127.0.0.1:${port}" "connect=tcp:127.0.0.1:${port}"
+            port_msg+="${port} "
+        done
+        info "Port forwarding: ${port_msg% }"
+    fi
+}
+
+init_host_home() {
+    if [[ ! -d "$HOST_HOME" ]]; then
+        info "Creating persistent home at ${HOST_HOME}"
+        mkdir -p "$HOST_HOME" || die "Failed to create persistent home directory: ${HOST_HOME}"
+        chmod 700 "$HOST_HOME"
+    fi
+    mkdir -p "${HOST_HOME}/workspace" || die "Failed to create workspace mount point: ${HOST_HOME}/workspace"
+
+    if [[ ! -f "${HOST_HOME}/.gitconfig" ]]; then
+        local host_git_name host_git_email
+        host_git_name=$(git config --global user.name 2>/dev/null) || true
+        host_git_email=$(git config --global user.email 2>/dev/null) || true
+        if [[ -n "$host_git_name" || -n "$host_git_email" ]]; then
+            info "Seeding git config from host"
+            {
+                [[ -n "$host_git_name" ]] && printf '[user]\n\tname = %s\n' "$host_git_name"
+                [[ -n "$host_git_email" ]] && printf '\temail = %s\n' "$host_git_email"
+            } > "${HOST_HOME}/.gitconfig"
+        fi
+    fi
+}
+
+# Unmount all bind-mounts under a rootfs directory without removing it.
+# Used by the cleanup trap to preserve the debootstrap cache on build failure.
+_safe_umount_rootfs() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+
+    local _cmd=""
+    [[ "$(id -u)" -ne 0 ]] && _cmd="sudo"
+
+    local mp
+    for mp in dev/pts dev sys proc; do
+        [[ -d "${dir}/${mp}" ]] || continue
+        ${_cmd} umount "${dir}/${mp}" 2>/dev/null \
+            || ${_cmd} umount -l "${dir}/${mp}" 2>/dev/null || true
+    done
+
+    while read -r leftover; do
+        ${_cmd} umount "$leftover" 2>/dev/null \
+            || ${_cmd} umount -l "$leftover" 2>/dev/null || true
+    done < <(awk -v d="${dir}/" '$5 ~ "^"d {print $5}' /proc/mounts 2>/dev/null || true)
+}
+
+# Safely remove a rootfs directory. Unmounts any bind-mounts first, then
+# verifies they are gone before running rm -rf. Without this, rm -rf can
+# traverse active bind-mounts into host /dev, /proc, /sys and destroy the
+# running system (e.g. /dev/pts → sudo breaks).
+_safe_rm_rootfs() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+
+    _safe_umount_rootfs "$dir"
+
+    # Auto-detect sudo need
+    local _cmd=""
+    [[ "$(id -u)" -ne 0 ]] && _cmd="sudo"
+
+    # Verify: check if any mount points remain under dir
+    local mounts_gone=true
+    local mp
+    for mp in dev/pts dev sys proc; do
+        [[ -d "${dir}/${mp}" ]] || continue
+        if mountpoint -q "${dir}/${mp}" 2>/dev/null; then
+            mounts_gone=false
+        fi
+    done
+    if awk -v d="${dir}/" '$5 ~ "^"d {found=1; exit} END {exit !found}' /proc/mounts 2>/dev/null; then
+        mounts_gone=false
+    fi
+
+    if [[ "${mounts_gone}" == true ]]; then
+        ${_cmd} rm -rf "${dir}"
+    else
+        warn "Bind-mounts still active under ${dir} — skipping rootfs removal."
+        warn "Manual cleanup: umount -l ${dir}/{dev/pts,dev,sys,proc} && rm -rf ${dir}"
+        return 1
+    fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_build() {
+    local build_start=$SECONDS
+    info "Building Debian 13 + AI coding tools image (this may take a while)..."
+
+    if image_artifacts_exist && vm_artifacts_exist; then
+        warn "Build artifacts already exist in ${BUILD_DIR} — skipping build."
+        warn "Run '$(basename "$0") rebuild' to force a fresh build."
+        return 0
+    fi
+
+    # Root check before any filesystem ops on BUILD_DIR (root-owned after previous build)
+    local sudo_cmd=""
+    if [[ "$(id -u)" -ne 0 ]]; then
+        if sudo -n true &>/dev/null; then
+            sudo_cmd="sudo"
+        else
+            die "Build needs root. Run as root, configure NOPASSWD sudo, or: sudo $(basename "$0") build"
+        fi
+    fi
+
+    # Check if restricted project workaround is needed (only when running as root)
+    if [[ "$(id -u)" -eq 0 ]]; then
+        _maybe_configure_uid_mapping
+    fi
+
+    # ── Mount namespace isolation ────────────────────────────────────────────
+    # Run the build inside an isolated mount namespace so bind-mounts of
+    # /dev, /proc, /sys cannot propagate back to the host.  The self-exec
+    # pattern replaces this process (same PID) with one in a new namespace.
+    if [[ "${_CS_IN_MOUNT_NS:-}" != "yes" ]]; then
+        export _CS_IN_MOUNT_NS=yes
+        exec unshare -m "$0" build
+    fi
+    mount --make-rprivate /
+
+    umask 077  # All build artifacts owner-only (scope: rest of cmd_build)
+    ${sudo_cmd} mkdir -p "$BUILD_DIR"
+    ${sudo_cmd} chmod 700 "$BUILD_DIR"
+    # Not local — cleanup trap needs these after cmd_build returns.
+    # Not local — cleanup trap needs these variables to survive after
+    # cmd_build's local scope ends on set -e exit.
+    _build_rootfs="${BUILD_DIR}/rootfs"
+    _build_yaml="${BUILD_DIR}/pack.yaml"
+    _build_success=false
+
+    # ── Cache detection: use existing rootfs if available ───────────────────
+    local use_cache=false
+    if [[ -d "$_build_rootfs" && -x "$_build_rootfs/usr/bin/bash" ]]; then
+        info "Using cached rootfs from ${_build_rootfs}"
+        use_cache=true
+    fi
+
+    local rootfs="$_build_rootfs"
+    local pack_yaml="$_build_yaml"
+    cleanup() {
+        if [[ "$_build_success" != true ]]; then
+            warn "Build failed — cleaning up partial artifacts..."
+            # Unmount bind-mounts but preserve rootfs (debootstrap cache is expensive)
+            _safe_umount_rootfs "${_build_rootfs}" || true
+            rm -f "${_build_yaml}" \
+                  "${BUILD_DIR}"/incus.tar.xz "${BUILD_DIR}"/rootfs.squashfs \
+                  "${BUILD_DIR}"/disk.qcow2 \
+                  "${BUILD_DIR}"/container.incus.tar.xz "${BUILD_DIR}"/container.rootfs.squashfs \
+                  "${BUILD_DIR}"/vm.incus.tar.xz "${BUILD_DIR}"/vm.disk.qcow2 \
+                  "${BUILD_DIR}"/version 2>/dev/null || true
+        fi
+    }
+    trap cleanup EXIT INT TERM
+
+    # ── Pack YAML (metadata for distrobuilder pack-incus) ────────────────────
+    cat > "${pack_yaml}" << 'PACK_YAML'
+image:
+  name: coding-sandbox
+  distribution: debian
+  release: trixie
+  description: Debian 13 (Trixie) Coding Sandbox
+  architecture: amd64
+
+source:
+  downloader: debootstrap
+  url: http://deb.debian.org/debian
+
+packages:
+  manager: apt
+
+targets:
+  incus:
+    vm:
+      filesystem: ext4
+      size: 21474836480
+
+files:
+  - path: /etc/hostname
+    generator: hostname
+
+  - path: /etc/hosts
+    generator: hosts
+
+  - path: /etc/machine-id
+    generator: dump
+    content: ""
+
+  - path: /var/lib/dbus/machine-id
+    generator: dump
+    content: ""
+
+  - name: incus-agent
+    generator: incus-agent
+    types:
+      - vm
+
+  - path: /etc/fstab
+    generator: fstab
+    types:
+      - vm
+
+  - path: /etc/tmpfiles.d/resolv-conf.conf
+    generator: dump
+    content: |-
+      L! /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf
+
+  - path: /etc/systemd/network/enp5s0.network
+    generator: dump
+    types:
+      - vm
+    content: |-
+      [Match]
+      Name=enp5s0
+
+      [Network]
+      DHCP=true
+      IPv6AcceptRA=yes
+
+      [DHCPv4]
+      UseDomains=true
+      UseMTU=true
+
+      [DHCP]
+      ClientIdentifier=mac
+
+  - path: /etc/systemd/network/eth0.network
+    generator: dump
+    types:
+      - container
+    content: |-
+      [Match]
+      Name=eth0
+
+      [Network]
+      DHCP=true
+      IPv6AcceptRA=yes
+
+      [DHCPv4]
+      UseDomains=true
+      UseMTU=true
+
+      [DHCP]
+      ClientIdentifier=mac
+
+actions:
+  - trigger: post-files
+    action: |-
+      #!/bin/sh
+      set -eux
+      grub-install --target=x86_64-efi --efi-directory=/boot/efi --no-nvram --removable
+      grub-install --target=x86_64-efi --efi-directory=/boot/efi --no-nvram --bootloader-id=debian
+      update-grub
+      ROOT_UUID=$(blkid -s UUID -o value "$(findmnt -n -o SOURCE /)" 2>/dev/null || true)
+      if [ -n "$ROOT_UUID" ] && [ -f /boot/grub/grub.cfg ]; then
+          sed -i "s|root=/dev/loop[^ ]*|root=UUID=${ROOT_UUID}|g" /boot/grub/grub.cfg
+      fi
+    types:
+      - vm
+PACK_YAML
+
+    # Inject architecture into pack YAML (heredoc is single-quoted, cannot expand vars)
+    sed -i "s/architecture: amd64/architecture: ${DEB_ARCH}/" "${pack_yaml}"
+    sed -i "s/x86_64-efi/${GRUB_TARGET}/g" "${pack_yaml}"
+
+    # ── APT proxy detection ──────────────────────────────────────────────────
+    local apt_proxy=""
+    apt_proxy=$(apt-config dump Acquire::http::Proxy 2>/dev/null \
+        | awk -F'"' '/^Acquire::http::Proxy / {print $2}') || true
+
+    # Build mirror URL: use proxy passthrough if available (apt-cacher-ng style)
+    local mirror="http://deb.debian.org/debian"
+    if [[ -n "$apt_proxy" && "$apt_proxy" != "DIRECT" ]]; then
+        mirror="${apt_proxy%/}/deb.debian.org/debian"
+        info "Using apt proxy: $apt_proxy"
+    else
+        info "No APT proxy configured. Build will download directly from mirrors (slower)."
+        info "To configure: echo 'Acquire::http::Proxy \"http://<proxy-host>:3142\";' | sudo tee /etc/apt/apt.conf.d/99proxy"
+    fi
+
+    # ── Bootstrap base system ────────────────────────────────────────────────
+    # Restore normal umask for rootfs construction — debootstrap and apt need
+    # standard permissions (755 dirs, 644 files) so binaries are executable
+    # by non-root users inside the container/VM.  umask 077 above protects
+    # only the build directory and final image artifacts.
+    umask 022
+
+    if [[ "$use_cache" == "true" ]]; then
+        info "Skipping debootstrap (using cached rootfs)..."
+    else
+        info "Bootstrapping Debian 13 (Trixie) base system..."
+        _safe_rm_rootfs "${rootfs}" || true
+        local debootstrap_start=$SECONDS
+        ${sudo_cmd} debootstrap \
+            --force-check-gpg \
+            --variant=minbase \
+            --include=apt-transport-https,locales \
+            --components=main,contrib,non-free,non-free-firmware \
+            trixie "${rootfs}" "${mirror}"
+        info "Debootstrap done in $(( SECONDS - debootstrap_start ))s"
+    fi
+
+    # ── APT sources (add security + updates) ─────────────────────────────────
+    ${sudo_cmd} tee "${rootfs}/etc/apt/sources.list" > /dev/null << 'SOURCES_EOF'
+deb http://deb.debian.org/debian/ trixie main non-free non-free-firmware contrib
+deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+SOURCES_EOF
+
+    # ── APT proxy in rootfs (persists in image for LAN use) ──────────────────
+    if [[ -n "$apt_proxy" && "$apt_proxy" != "DIRECT" ]]; then
+        ${sudo_cmd} bash -c 'printf "Acquire::http::Proxy \"%s\";\nAcquire::https::Proxy \"%s\";\n" \
+            "$1" "$1" > "$2/etc/apt/apt.conf.d/99proxy"' _ "${apt_proxy}" "${rootfs}"
+    fi
+
+    # ── Replicate host timezone and locales ──────────────────────────────────
+    if [[ -f /etc/timezone ]]; then
+        ${sudo_cmd} cp /etc/timezone "${rootfs}/etc/timezone"
+    fi
+    if [[ -f /etc/localtime ]]; then
+        ${sudo_cmd} cp /etc/localtime "${rootfs}/etc/localtime"
+    fi
+    if [[ -f /etc/locale.gen ]]; then
+        ${sudo_cmd} cp /etc/locale.gen "${rootfs}/etc/locale.gen"
+        ${sudo_cmd} chroot "${rootfs}" locale-gen
+    fi
+
+    # ── Replicate Caddy CA certificate (if present) ──────────────────────────
+    # Copy Caddy CA certificate files if present (update-ca-certificates runs
+    # later inside the chroot, after ca-certificates package is installed)
+    local caddy_ca="/usr/local/share/ca-certificates/dkube-caddy-ca"
+    if [[ -d "$caddy_ca" ]]; then
+        info "Copying Caddy CA certificate into rootfs..."
+        ${sudo_cmd} mkdir -p "${rootfs}${caddy_ca}"
+        ${sudo_cmd} cp "${caddy_ca}/"*.crt "${rootfs}${caddy_ca}/"
+    fi
+
+    _mount_chroot() {
+        local mp
+        for mp in proc sys dev dev/pts; do
+            ${sudo_cmd} mkdir -p "${rootfs}/${mp}"
+        done
+        ${sudo_cmd} mount --bind /proc "${rootfs}/proc"
+        ${sudo_cmd} mount --bind /sys  "${rootfs}/sys"
+        ${sudo_cmd} mount --bind /dev  "${rootfs}/dev"
+        ${sudo_cmd} mount --bind /dev/pts "${rootfs}/dev/pts"
+    }
+    _umount_chroot() {
+        local mp
+        for mp in dev/pts dev sys proc; do
+            ${sudo_cmd} umount "${rootfs}/${mp}" 2>/dev/null \
+                || ${sudo_cmd} umount -l "${rootfs}/${mp}" 2>/dev/null || true
+        done
+    }
+
+    # ── Install packages and configure system ────────────────────────────────
+    info "Installing packages and configuring system (this takes several minutes)..."
+    _mount_chroot
+
+    # ── Install coding tools (before chroot — no chroot needed for downloads) ──
+    info "Installing coding tools..."
+    local tool_name tool_script
+    for tool_name in ${CODING_SANDBOX_TOOLS}; do
+        tool_script="${TOOLS_DIR}/${tool_name}"
+        if [[ ! -x "$tool_script" ]]; then
+            die "Unknown tool: ${tool_name} (no executable at ${tool_script})"
+        fi
+        info "  Installing ${tool_name}..."
+        ${sudo_cmd} bash "${tool_script}" "${rootfs}/usr/local/bin"
+    done
+
+    ${sudo_cmd} chroot "${rootfs}" bash << 'SETUP_EOF'
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export LANG=C LC_ALL=C
+
+# ── Packages ──────────────────────────────────────────────────────────────
+apt-get update
+apt-get -y full-upgrade
+apt-get install -y --no-install-recommends \
+    systemd systemd-sysv dbus udev apt-utils \
+    ca-certificates locales tzdata \
+    systemd-resolved iproute2 iputils-ping dnsutils \
+    openssh-server \
+    sudo curl wget git vim nano less gnupg lsb-release \
+    procps htop most unzip netbase ripgrep fzf shellcheck \
+    jq gh glow bat ncdu libxml2-utils
+
+# ── Default editor and pager ─────────────────────────────────────────────
+update-alternatives --set editor /bin/nano
+update-alternatives --set pager /usr/bin/most
+
+# Export EDITOR for tools that check the environment variable (e.g. Claude Code)
+printf 'export EDITOR=nano\n' > /etc/profile.d/editor.sh
+chmod 644 /etc/profile.d/editor.sh
+
+# ── Default sandbox user ─────────────────────────────────────────────────
+useradd -m -s /bin/bash -G sudo sandbox || true
+echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
+chmod 0440 /etc/sudoers.d/sandbox
+
+# Generate SSH key on first login
+printf '#!/bin/bash\nif [ ! -f ~/.ssh/id_ed25519 ]; then\n  mkdir -p ~/.ssh && chmod 700 ~/.ssh\n  ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q\nfi\n' \
+    > /etc/profile.d/ssh-keygen.sh
+chmod 644 /etc/profile.d/ssh-keygen.sh
+
+# ── Network (systemd-networkd) ───────────────────────────────────────────
+systemctl enable systemd-networkd.service
+systemctl enable systemd-networkd.socket
+systemctl enable systemd-resolved
+
+# ── SSH ──────────────────────────────────────────────────────────────────
+systemctl enable ssh
+sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+printf 'PasswordAuthentication no\n' > /etc/ssh/sshd_config.d/50-pubkey-only.conf
+
+# ── MOTD (placeholder, replaced after chroot) ──────────────────────────
+: # MOTD is written outside chroot to include dynamic tool list
+
+# ── Serial console ───────────────────────────────────────────────────────
+systemctl enable serial-getty@ttyS0.service
+
+# ── VM disk performance: enable discard/trim ─────────────────────────────
+printf 'ACTION=="add|change", KERNEL=="vd[a-z]", ATTR{queue/scheduler}="none"\n' \
+    > /etc/udev/rules.d/60-scheduler.rules
+
+# ── CA certificates (pick up any certs copied into rootfs before chroot)
+update-ca-certificates 2>/dev/null || true
+
+# ── Clean up ─────────────────────────────────────────────────────────────
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+SETUP_EOF
+
+    _umount_chroot
+
+    # ── Dynamic MOTD (based on CODING_SANDBOX_TOOLS) ──────────────────────
+    local motd_tools=""
+    for tool_name in ${CODING_SANDBOX_TOOLS}; do
+        case "$tool_name" in
+            claude-code)    motd_tools+=$'  \u2551     claude   \u2014 Claude Code           \u2551\n' ;;
+            opencode)       motd_tools+=$'  \u2551     opencode \u2014 OpenCode              \u2551\n' ;;
+            crush)          motd_tools+=$'  \u2551     crush    \u2014 Crush                 \u2551\n' ;;
+            qwen-code)      motd_tools+=$'  \u2551     qwen     \u2014 Qwen Code             \u2551\n' ;;
+        esac
+    done
+    ${sudo_cmd} tee "${rootfs}/etc/motd" > /dev/null <<MOTD_EOF
+
+  ╔══════════════════════════════════════╗
+  ║   AI Code Sandbox (Debian 13)        ║
+  ║                                      ║
+  ║   Available tools:                   ║
+${motd_tools}  ║                                      ║
+  ║   User: sandbox  (sudo, no password) ║
+  ╚══════════════════════════════════════╝
+
+MOTD_EOF
+
+    # ── Version file in rootfs ────────────────────────────────────────────
+    get_version | ${sudo_cmd} tee "${rootfs}/etc/coding-sandbox-version" > /dev/null
+
+    # APT proxy persists in image for LAN use
+
+    # ── Container image ──────────────────────────────────────────────────────
+    local pack_start=$SECONDS
+    info "Packing container image..."
+    rm -f "${BUILD_DIR}"/incus.tar.xz "${BUILD_DIR}"/rootfs.squashfs
+    LANG=C LC_ALL=C ${sudo_cmd} distrobuilder pack-incus "${pack_yaml}" \
+        "${rootfs}" "${BUILD_DIR}" \
+        --type=split \
+        --compression=xz
+
+    if [[ ! -f "${BUILD_DIR}/incus.tar.xz" ]]; then
+        die "Container pack failed: incus.tar.xz not found"
+    fi
+    info "Container image packed in $(( SECONDS - pack_start ))s"
+
+    # Rename to unique artifact names
+    mv "${BUILD_DIR}/incus.tar.xz" "${BUILD_DIR}/container.incus.tar.xz"
+    mv "${BUILD_DIR}/rootfs.squashfs" "${BUILD_DIR}/container.rootfs.squashfs"
+
+    # ── VM image ─────────────────────────────────────────────────────────────
+    info "Installing VM packages (kernel + bootloader)..."
+    _mount_chroot
+
+    ${sudo_cmd} chroot "${rootfs}" bash -s "$DEB_ARCH" <<'CHROOT_VM'
+        DEB_ARCH="$1"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y "linux-image-${DEB_ARCH}" "grub-efi-${DEB_ARCH}" acpid qemu-guest-agent
+
+        # Serial console for GRUB
+        if [ -f /etc/default/grub ]; then
+            sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"quiet console=tty0 console=ttyS0,115200\"/" /etc/default/grub
+            sed -i "s/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\"console=tty0 console=ttyS0,115200\"/" /etc/default/grub
+        fi
+
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+CHROOT_VM
+
+    _umount_chroot
+
+    info "Packing VM image..."
+    local vm_pack_start=$SECONDS
+    rm -f "${BUILD_DIR}"/incus.tar.xz "${BUILD_DIR}"/disk.qcow2
+    LANG=C LC_ALL=C ${sudo_cmd} distrobuilder pack-incus "${pack_yaml}" \
+        "${rootfs}" "${BUILD_DIR}" \
+        --vm \
+        --type=split \
+        --compression=xz
+
+    if [[ ! -f "${BUILD_DIR}/incus.tar.xz" || ! -f "${BUILD_DIR}/disk.qcow2" ]]; then
+        die "VM pack failed: expected artifacts not found"
+    fi
+    info "VM image packed in $(( SECONDS - vm_pack_start ))s"
+
+    # Rename to unique artifact names
+    mv "${BUILD_DIR}/incus.tar.xz" "${BUILD_DIR}/vm.incus.tar.xz"
+    mv "${BUILD_DIR}/disk.qcow2" "${BUILD_DIR}/vm.disk.qcow2"
+
+    _build_success=true
+    trap - EXIT
+
+    rm -f "${pack_yaml}"
+    # Ensure no bind-mounts survive (distrobuilder may leave some behind)
+    _safe_rm_rootfs "${rootfs}" || warn "Rootfs not fully cleaned — see warnings above."
+
+    # Clean up old-style artifact names from previous builds
+    rm -f "${BUILD_DIR}/incus.tar.xz" "${BUILD_DIR}/rootfs.squashfs" \
+          "${BUILD_DIR}/disk.qcow2" 2>/dev/null || true
+
+    # Write version file
+    get_version > "${BUILD_DIR}/version"
+
+    # Set permissions: root-owned, readable by incus group
+    chgrp incus "${BUILD_DIR}/container.incus.tar.xz" \
+                "${BUILD_DIR}/container.rootfs.squashfs" \
+                "${BUILD_DIR}/vm.incus.tar.xz" \
+                "${BUILD_DIR}/vm.disk.qcow2" \
+                "${BUILD_DIR}/version"
+    chmod 640   "${BUILD_DIR}/container.incus.tar.xz" \
+                "${BUILD_DIR}/container.rootfs.squashfs" \
+                "${BUILD_DIR}/vm.incus.tar.xz" \
+                "${BUILD_DIR}/vm.disk.qcow2" \
+                "${BUILD_DIR}/version"
+    chmod 750 "${BUILD_DIR}"
+    chgrp incus "${BUILD_DIR}"
+
+    local elapsed=$(( SECONDS - build_start ))
+    success "Build completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s."
+    info "Artifacts in ${BUILD_DIR} — import happens automatically on first use."
+}
+
+cmd_create_vm() {
+    if vm_exists; then
+        # Apply current resource limits only when stopped (can't resize live memory)
+        if ! vm_is_running; then
+            incus config set "${VM_NAME}" \
+                limits.cpu="${VM_CPU}" \
+                limits.memory="${VM_RAM}"
+        fi
+        return 0
+    fi
+
+    image_exists || die "Image '${IMAGE_ALIAS}' not found. Run '$(basename "$0") build' first."
+
+    info "Creating VM '${VM_NAME}' from image '${IMAGE_ALIAS}'..."
+    incus init "${IMAGE_ALIAS}" "${VM_NAME}" \
+        --vm \
+        --config limits.cpu="${VM_CPU}" \
+        --config limits.memory="${VM_RAM}" \
+        --device root,size="${VM_DISK}"
+
+    _add_port_forwarding "${VM_NAME}"
+
+    success "VM '${VM_NAME}' created."
+}
+
+sync_host_settings() {
+    # Gather host values
+    local host_tz host_utc host_lang host_apt_proxy host_git_name host_git_email
+    host_tz=$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null) || true
+    host_utc=$(date -u '+%Y-%m-%d %H:%M:%S')
+    host_lang=$(locale 2>/dev/null | awk -F= '/^LANG=/{print $2}') || true
+    host_apt_proxy=$(apt-config dump Acquire::http::Proxy 2>/dev/null \
+        | awk -F'"' '/^Acquire::http::Proxy / {print $2}') || true
+    host_git_name=$(git config --global user.name 2>/dev/null) || true
+    host_git_email=$(git config --global user.email 2>/dev/null) || true
+
+    # Apply all settings in a single incus exec call — prints changed settings to stdout
+    local sync_output
+    sync_output=$(incus exec "${VM_NAME}" -- bash -s \
+        "${host_tz}" \
+        "${host_utc}" \
+        "${host_lang}" \
+        "${host_apt_proxy}" \
+        "${host_git_name}" \
+        "${host_git_email}" \
+        "${SHELL_USER}" \
+        << 'SYNC_EOF'
+#!/bin/bash
+set -eu
+
+HOST_TZ="$1"; HOST_UTC="$2"; HOST_LANG="$3"; HOST_APT_PROXY="$4"
+HOST_GIT_NAME="$5"; HOST_GIT_EMAIL="$6"; SHELL_USER="$7"
+
+# ── Timezone (compare both /etc/timezone and /etc/localtime — distrobuilder
+#    may copy /etc/timezone but reset /etc/localtime to UTC)
+if [ -n "$HOST_TZ" ]; then
+    CUR_TZ=$(cat /etc/timezone 2>/dev/null) || true
+    CUR_LINK=$(readlink /etc/localtime 2>/dev/null) || true
+    if [ "$HOST_TZ" != "$CUR_TZ" ] || [ "$CUR_LINK" != "/usr/share/zoneinfo/${HOST_TZ}" ]; then
+        timedatectl set-timezone "$HOST_TZ" 2>/dev/null \
+            || { ln -sf "/usr/share/zoneinfo/${HOST_TZ}" /etc/localtime && echo "$HOST_TZ" > /etc/timezone; }
+        echo "Timezone updated: $HOST_TZ"
+    fi
+fi
+
+# ── Date & time (may fail in restricted environments)
+date -u -s "$HOST_UTC" &>/dev/null || true
+
+# ── Locale
+if [ -n "$HOST_LANG" ]; then
+    CUR_LANG=$(locale 2>/dev/null | awk -F= '/^LANG=/{print $2}')
+    if [ "$HOST_LANG" != "$CUR_LANG" ]; then
+        sed -i "s/^# *\\(${HOST_LANG}\\)/\\1/" /etc/locale.gen 2>/dev/null
+        locale-gen &>/dev/null
+        update-locale "LANG=${HOST_LANG}"
+        echo "Locale updated: $HOST_LANG"
+    fi
+fi
+
+# ── APT proxy
+CUR_PROXY=$(apt-config dump Acquire::http::Proxy 2>/dev/null \
+    | awk -F'"' '/^Acquire::http::Proxy /{print $2}')
+if [ "$HOST_APT_PROXY" != "$CUR_PROXY" ]; then
+    if [ -n "$HOST_APT_PROXY" ] && [ "$HOST_APT_PROXY" != "DIRECT" ]; then
+        printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
+            "$HOST_APT_PROXY" "$HOST_APT_PROXY" > /etc/apt/apt.conf.d/99proxy
+        echo "APT proxy updated: $HOST_APT_PROXY"
+    else
+        if [ -f /etc/apt/apt.conf.d/99proxy ]; then
+            rm -f /etc/apt/apt.conf.d/99proxy
+            echo "APT proxy removed"
+        fi
+    fi
+fi
+
+# ── Git config
+if [ -n "$HOST_GIT_NAME" ]; then
+    CUR_NAME=$(su - "$SHELL_USER" -c "git config --global user.name" 2>/dev/null) || true
+    if [ "$HOST_GIT_NAME" != "$CUR_NAME" ]; then
+        su - "$SHELL_USER" -c "git config --global user.name $(printf '%q' "$HOST_GIT_NAME")" 2>/dev/null
+        echo "Git user.name updated: $HOST_GIT_NAME"
+    fi
+fi
+if [ -n "$HOST_GIT_EMAIL" ]; then
+    CUR_EMAIL=$(su - "$SHELL_USER" -c "git config --global user.email" 2>/dev/null) || true
+    if [ "$HOST_GIT_EMAIL" != "$CUR_EMAIL" ]; then
+        su - "$SHELL_USER" -c "git config --global user.email $(printf '%q' "$HOST_GIT_EMAIL")" 2>/dev/null
+        echo "Git user.email updated: $HOST_GIT_EMAIL"
+    fi
+fi
+SYNC_EOF
+    ) || true
+
+    # Print each changed setting as a sandbox info line
+    if [[ -n "$sync_output" ]]; then
+        while IFS= read -r line; do
+            info "$line"
+        done <<< "$sync_output"
+    fi
+}
+
+cmd_start() {
+    cmd_create_vm
+    if vm_is_running; then
+        info "VM '${VM_NAME}' is already running."
+    else
+        info "Starting VM '${VM_NAME}'..."
+        incus start "${VM_NAME}"
+        success "VM '${VM_NAME}' is running."
+    fi
+    wait_for_vm
+    sync_host_settings
+}
+
+cmd_stop() {
+    if ! vm_exists; then
+        warn "VM '${VM_NAME}' does not exist."
+        return 0
+    fi
+    if ! vm_is_running; then
+        warn "VM '${VM_NAME}' is already stopped."
+        return 0
+    fi
+    info "Stopping VM '${VM_NAME}'..."
+    incus stop "${VM_NAME}" --timeout=30 || incus stop "${VM_NAME}" --force
+    success "VM '${VM_NAME}' stopped."
+}
+
+cmd_shell() {
+    if [[ "$MODE" == "vm" ]]; then
+        if ! ensure_vm_image; then
+            die "No VM image found. Build it first:\n  sudo coding-sandbox build"
+        fi
+        _check_image_version "${IMAGE_ALIAS}"
+        cmd_start
+        echo ""
+        echo -e "${BOLD}Connecting to ${VM_NAME} as '${SHELL_USER}'...${RESET}"
+        echo -e "${CYAN}(Type 'exit' or Ctrl-D to leave the sandbox)${RESET}"
+        echo ""
+        incus exec "${VM_NAME}" -- su - "${SHELL_USER}"
+    else
+        if ! ensure_container_image; then
+            die "No container image found. Build it first:\n  sudo coding-sandbox build"
+        fi
+        _check_image_version "${CONTAINER_IMAGE_ALIAS}"
+        launch_container shell
+    fi
+}
+
+launch_container() {
+    local tool="$1"
+
+    init_host_home
+
+    # Warn if PWD is on a remote filesystem
+    local _fs_type
+    _fs_type=$(stat -f -c %T "$PWD" 2>/dev/null) || true
+    case "$_fs_type" in
+        nfs|fuse*|cifs|smb*)
+            warn "Working directory is on a ${_fs_type} filesystem — container mount may not work reliably." ;;
+    esac
+
+    # Not local — cleanup trap needs this after launch_container returns.
+    _container_name=$(container_name_for_dir)
+    local container_name="$_container_name"
+    local mount_path
+    mount_path=$(mount_path_for_dir)
+
+    # Check if container already running from this directory
+    if incus info "$container_name" &>/dev/null; then
+        die "A sandbox container (${container_name}) is already running for this directory.\n  Use 'incus exec ${container_name} -- bash' to attach."
+    fi
+
+    cleanup() {
+        [[ -n "${_container_name:-}" ]] || return 0
+        if incus info "$_container_name" &>/dev/null; then
+            incus stop "$_container_name" --force 2>/dev/null || true
+            incus delete "$_container_name" --force 2>/dev/null || true
+        fi
+        # Remove empty mountpoint directory from persistent home
+        rmdir "${HOST_HOME}/$(_dir_slug)" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    info "Launching ephemeral container '${container_name}'..."
+    incus init "${CONTAINER_IMAGE_ALIAS}" "${container_name}" --ephemeral < /dev/null
+
+    incus config device add "${container_name}" sandbox-home disk \
+        source="${HOST_HOME}" path="${CONTAINER_HOME}" shift=true
+    incus config device add "${container_name}" workspace disk \
+        source="$PWD" path="${mount_path}" shift=true
+
+    # Root user needs explicit UID mapping (shift=true maps 0→0, not 0→1000)
+    if [[ "$(id -u)" -eq 0 ]]; then
+        incus config device set "${container_name}" sandbox-home shift=false 2>/dev/null || true
+        incus config device set "${container_name}" workspace shift=false 2>/dev/null || true
+        incus config set "${container_name}" raw.idmap="$(printf 'uid 0 %d\ngid 0 %d' \
+            "${CONTAINER_UID}" "${CONTAINER_GID}")"
+    fi
+
+    # Try start with shift=true; fall back to raw.idmap if blocked (Incus 6.0.x
+    # restricted projects); die with guidance if both fail.
+    if ! incus start "${container_name}" 2>/dev/null; then
+        warn "shift=true blocked — trying raw.idmap fallback..."
+        incus delete --force "${container_name}"
+        incus init "${CONTAINER_IMAGE_ALIAS}" "${container_name}" --ephemeral < /dev/null
+        # Disk devices default to shift=false — correct for raw.idmap fallback
+        incus config device add "${container_name}" sandbox-home disk \
+            source="${HOST_HOME}" path="${CONTAINER_HOME}"
+        incus config device add "${container_name}" workspace disk \
+            source="$PWD" path="${mount_path}"
+        incus config set "${container_name}" raw.idmap="$(printf 'uid %d %d\ngid %d %d' \
+            "$(id -u)" "${CONTAINER_UID}" "$(id -g)" "${CONTAINER_GID}")"
+        if ! incus start "${container_name}" 2>/dev/null; then
+            local _project
+            _project=$(_incus_project)
+            _project="${_project:-<project>}"
+            die "Container start failed — UID mapping not available in this Incus project.\n\n" \
+                "  An admin needs to run:\n" \
+                "    incus project set ${_project} restricted.containers.lowlevel=allow\n" \
+                "    incus project set ${_project} restricted.idmap.uid=1000\n" \
+                "    incus project set ${_project} restricted.idmap.gid=1000\n" \
+                "    echo 'root:1000:1' | sudo tee -a /etc/subuid\n" \
+                "    echo 'root:1000:1' | sudo tee -a /etc/subgid\n" \
+                "    sudo systemctl restart incus\n\n" \
+                "  See README.md 'Incus 6.0.x UID Mapping' for details."
+        fi
+    fi
+
+    _add_port_forwarding "${container_name}"
+
+    local timeout=15 elapsed=0
+    while (( elapsed < timeout )); do
+        if incus exec "${container_name}" -- true &>/dev/null; then
+            break
+        fi
+        sleep 1
+        (( elapsed += 1 ))
+    done
+    (( elapsed < timeout )) || die "Container did not become reachable within ${timeout}s"
+
+    # Bug fix #5: warn on DNS fix failure instead of silent swallow
+    if ! incus exec "${container_name}" -- \
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null; then
+        warn "Failed to fix DNS inside container — network may not work."
+    fi
+
+    # Sync timezone from host
+    local host_tz
+    host_tz=$(cat /etc/timezone 2>/dev/null) || true
+    if [[ -n "$host_tz" ]]; then
+        incus exec "${container_name}" -- \
+            ln -sf "/usr/share/zoneinfo/${host_tz}" /etc/localtime 2>/dev/null || true
+        incus exec "${container_name}" -- \
+            bash -c 'printf "%s\n" "$1" > /etc/timezone' _ "${host_tz}" 2>/dev/null || true
+    fi
+
+    echo ""
+    if [[ "$tool" == "shell" ]]; then
+        echo -e "${BOLD}Container '${container_name}' — ${PWD}${RESET}"
+        echo -e "${CYAN}(Type 'exit' or Ctrl-D to leave; container is destroyed on exit)${RESET}"
+        echo ""
+        incus exec "${container_name}" \
+            --user "${CONTAINER_UID}" --group "${CONTAINER_GID}" \
+            --cwd "${mount_path}" \
+            --env "HOME=${CONTAINER_HOME}" \
+            --env "USER=${SHELL_USER}" \
+            -- bash -l
+    else
+        echo -e "${BOLD}Starting ${tool} in '${container_name}' — ${PWD}${RESET}"
+        echo -e "${CYAN}(Exit ${tool} to leave; container is destroyed on exit)${RESET}"
+        echo ""
+        incus exec "${container_name}" \
+            --user "${CONTAINER_UID}" --group "${CONTAINER_GID}" \
+            --cwd "${mount_path}" \
+            --env "HOME=${CONTAINER_HOME}" \
+            --env "USER=${SHELL_USER}" \
+            -- bash -lc "${tool}"
+    fi
+}
+
+cmd_destroy() {
+    if [[ "${_force_yes}" != true ]]; then
+        warn "⚠ Alle Daten in der VM gehen verloren (Projekte, Konfigurationen, Sessions)!"
+        echo -n "Fortfahren? [y/N] "
+        local answer
+        read -r answer
+        if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+            echo "Abgebrochen."
+            return 1
+        fi
+    fi
+
+    if vm_exists; then
+        info "Deleting VM '${VM_NAME}'..."
+        vm_is_running && incus stop "${VM_NAME}" --force
+        incus delete "${VM_NAME}"
+        success "VM '${VM_NAME}' deleted."
+    else
+        warn "VM '${VM_NAME}' not found — nothing to delete."
+    fi
+
+    if image_exists; then
+        info "Deleting VM image '${IMAGE_ALIAS}'..."
+        incus image delete "${IMAGE_ALIAS}"
+        success "VM image '${IMAGE_ALIAS}' deleted."
+    else
+        warn "VM image '${IMAGE_ALIAS}' not found — nothing to delete."
+    fi
+
+    if container_image_exists; then
+        # Warn if sandbox containers are running from this image
+        local running
+        running=$(incus list --format csv | awk -F',' '$1~/^cs-/ && $2=="RUNNING"' | wc -l)
+        if (( running > 0 )); then
+            warn "${running} sandbox container(s) still running."
+        fi
+        info "Deleting container image '${CONTAINER_IMAGE_ALIAS}'..."
+        incus image delete "${CONTAINER_IMAGE_ALIAS}"
+        success "Container image '${CONTAINER_IMAGE_ALIAS}' deleted."
+    else
+        warn "Container image '${CONTAINER_IMAGE_ALIAS}' not found — nothing to delete."
+    fi
+
+    # Purge build cache only with --purge
+    if [[ "${_purge}" == true ]]; then
+        info "Purging build cache (${BUILD_DIR})..."
+        rm -rf "${BUILD_DIR}"
+        success "Build cache deleted."
+    fi
+}
+
+cmd_rebuild() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        die "Rebuild needs root. Run: sudo $(basename "$0") rebuild"
+    fi
+    # Prompt is handled in cmd_destroy
+    cmd_destroy
+    # Remove image artifacts so cmd_build doesn't skip (rootfs cache is preserved)
+    rm -f "${BUILD_DIR}/container.incus.tar.xz" "${BUILD_DIR}/container.rootfs.squashfs" \
+          "${BUILD_DIR}/vm.incus.tar.xz" "${BUILD_DIR}/vm.disk.qcow2" \
+          "${BUILD_DIR}/version" 2>/dev/null || true
+    cmd_build
+    # Import as invoking user (cmd_rebuild runs via sudo)
+    ensure_container_image || warn "Container image import failed — import manually with 'coding-sandbox shell'"
+    ensure_vm_image || warn "VM image import failed — import manually with 'coding-sandbox --vm shell'"
+    success "Rebuild complete. Run '$(basename "$0") shell' or '$(basename "$0") --vm shell' to start."
+}
+
+cmd_update() {
+    if [[ "$MODE" != "vm" ]]; then
+        die "Update is only supported for VMs. Containers use the image directly.\n" \
+            "  Run 'sudo $(basename "$0") rebuild' to rebuild images with latest packages."
+    fi
+
+    if ! vm_exists; then
+        die "VM does not exist. Run 'coding-sandbox --vm start' first."
+    fi
+    if ! vm_is_running; then
+        info "Starting VM..."
+        incus start "${VM_NAME}"
+        wait_for_vm
+    fi
+
+    info "Updating system packages..."
+    incus exec "${VM_NAME}" -- apt-get update
+    incus exec "${VM_NAME}" -- apt-get upgrade -y
+
+    info "Updating coding tools..."
+    local tool_name tool_script
+    for tool_name in ${CODING_SANDBOX_TOOLS}; do
+        tool_script="${TOOLS_DIR}/${tool_name}"
+        if [[ ! -x "$tool_script" ]]; then
+            warn "Tool script not found: ${tool_script} — skipping"
+            continue
+        fi
+        # Run uninstaller first if present (clean update)
+        local uninstaller="/usr/local/lib/uninstallers/${tool_name}"
+        if incus exec "${VM_NAME}" -- test -x "${uninstaller}" 2>/dev/null; then
+            info "  Uninstalling ${tool_name}..."
+            incus exec "${VM_NAME}" -- "${uninstaller}"
+        fi
+        info "  Installing ${tool_name}..."
+        incus exec "${VM_NAME}" -- bash -s /usr/local/bin < "${tool_script}"
+    done
+
+    # Update version marker
+    local version
+    version=$(get_version)
+    incus exec "${VM_NAME}" -- bash -c 'printf "%s\n" "$1" > /etc/coding-sandbox-version' _ "${version}"
+
+    sync_host_settings
+
+    success "Update complete!"
+}
+
+cmd_status() {
+    local script_ver c_ver v_ver
+    script_ver=$(get_version)
+
+    echo -e "\n${BOLD}=== Images ===${RESET}"
+    if container_image_exists; then
+        c_ver=$(incus image get-property "${CONTAINER_IMAGE_ALIAS}" user.coding-sandbox-version 2>/dev/null) || c_ver="unknown"
+        echo "  Container: ${CONTAINER_IMAGE_ALIAS} (${c_ver})"
+    else
+        if image_artifacts_exist; then
+            echo "  Container: not imported — artifacts available, will import on next shell"
+        else
+            echo "  Container: not available — run 'sudo coding-sandbox build'"
+        fi
+    fi
+    if image_exists; then
+        v_ver=$(incus image get-property "${IMAGE_ALIAS}" user.coding-sandbox-version 2>/dev/null) || v_ver="unknown"
+        echo "  VM:        ${IMAGE_ALIAS} (${v_ver})"
+    else
+        if vm_artifacts_exist; then
+            echo "  VM:        not imported — artifacts available, will import on next --vm shell"
+        else
+            echo "  VM:        not available — run 'sudo coding-sandbox build'"
+        fi
+    fi
+    echo "  Script:    ${script_ver}"
+
+    if [[ -n "${c_ver:-}" && "$c_ver" != "unknown" && "$c_ver" != "$script_ver" ]] \
+    || [[ -n "${v_ver:-}" && "$v_ver" != "unknown" && "$v_ver" != "$script_ver" ]]; then
+        warn "Images outdated — run 'coding-sandbox rebuild' to update"
+    fi
+
+    echo -e "\n${BOLD}=== Build Artifacts ===${RESET}"
+    if image_artifacts_exist; then
+        local c_size
+        c_size=$(du -sh "${BUILD_DIR}/container.incus.tar.xz" 2>/dev/null | cut -f1) || c_size="?"
+        echo "  Container: present (${c_size})"
+    else
+        echo "  Container: not found"
+    fi
+    if vm_artifacts_exist; then
+        local v_size
+        v_size=$(du -sh "${BUILD_DIR}/vm.disk.qcow2" 2>/dev/null | cut -f1) || v_size="?"
+        echo "  VM:        present (${v_size})"
+    else
+        echo "  VM:        not found"
+    fi
+
+    echo -e "\n${BOLD}=== VM ===${RESET}"
+    if vm_exists; then
+        incus list "${VM_NAME}" --format table
+    else
+        echo "  (no VM '${VM_NAME}')"
+    fi
+    echo ""
+}
+
+cmd_doctor() {
+    local checks_ok=0 checks_warn=0 checks_err=0
+
+    _doc_ok()   { printf "  %-16s %-30s ${GREEN}ok${RESET}\n" "$1" "$2"; ((checks_ok++)) || true; }
+    _doc_warn() { printf "  %-16s %-30s ${YELLOW}WARN${RESET}\n" "$1" "$2"; ((checks_warn++)) || true; }
+    _doc_err()  { printf "  %-16s %-30s ${RED}ERROR${RESET}\n" "$1" "$2"; ((checks_err++)) || true; }
+    _doc_info() { printf "  %-16s %s\n" "$1" "$2"; }
+
+    echo ""
+    echo -e "${BOLD}=== System ===${RESET}"
+
+    local host_arch
+    host_arch=$(uname -m)
+    if [[ "$host_arch" == "x86_64" ]]; then
+        _doc_ok "Architecture:" "${host_arch} (${DEB_ARCH})"
+    else
+        _doc_warn "Architecture:" "${host_arch} (${DEB_ARCH})"
+    fi
+
+    local free_gb
+    if [[ -d "$BUILD_DIR" ]]; then
+        free_gb=$(df -BG "${BUILD_DIR}" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G') || free_gb=0
+    else
+        free_gb=$(df -BG "${_REAL_HOME}" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G') || free_gb=0
+    fi
+    if (( free_gb >= 5 )); then
+        _doc_ok "Disk space:" "${free_gb}GB free"
+    elif (( free_gb >= 2 )); then
+        _doc_warn "Disk space:" "${free_gb}GB free"
+    else
+        _doc_err "Disk space:" "${free_gb}GB free"
+    fi
+
+    _doc_info "Script version:" "$(get_version)"
+
+    echo ""
+    echo -e "${BOLD}=== Dependencies ===${RESET}"
+
+    if command -v incus &>/dev/null; then
+        local incus_ver
+        incus_ver=$(incus version 2>/dev/null | awk '/^Client version:/{print $3}') || incus_ver="unknown"
+        _doc_ok "incus:" "${incus_ver}"
+    else
+        _doc_err "incus:" "not found"
+    fi
+
+    # distrobuilder and debootstrap live in /usr/sbin which may not be in
+    # a regular user's PATH — check both PATH and /usr/sbin explicitly,
+    # since 'build' runs under sudo anyway.
+    if command -v distrobuilder &>/dev/null || [[ -x /usr/sbin/distrobuilder ]]; then
+        _doc_ok "distrobuilder:" "present"
+    else
+        _doc_err "distrobuilder:" "not found (needed for build)"
+    fi
+
+    if command -v debootstrap &>/dev/null || [[ -x /usr/sbin/debootstrap ]]; then
+        _doc_ok "debootstrap:" "present"
+    else
+        _doc_err "debootstrap:" "not found (needed for build)"
+    fi
+
+    if command -v incus &>/dev/null; then
+        echo ""
+        echo -e "${BOLD}=== Incus ===${RESET}"
+
+        local incus_err
+        incus_err=$(incus list 2>&1 >/dev/null) || true
+        if incus list &>/dev/null 2>&1; then
+            _doc_ok "Initialized:" "yes"
+        elif echo "$incus_err" | grep -qi "permission"; then
+            _doc_err "Permissions:" "cannot access Incus socket"
+            _doc_info "" "Add yourself to the incus group:"
+            _doc_info "" "  sudo usermod -aG incus \$(whoami)"
+            _doc_info "" "Then log out and back in."
+        else
+            _doc_err "Initialized:" "no — run 'incus admin init --minimal'"
+        fi
+
+        local pool_output pool_rc
+        pool_output=$(incus storage list --format csv 2>&1) && pool_rc=0 || pool_rc=$?
+        if [[ $pool_rc -ne 0 ]]; then
+            _doc_warn "Storage pool:" "cannot query (restricted project?)"
+        elif [[ -z "$pool_output" ]]; then
+            _doc_err "Storage pool:" "none"
+        else
+            local pool
+            pool=$(echo "$pool_output" | head -1 | cut -d',' -f1)
+            _doc_ok "Storage pool:" "$pool"
+        fi
+
+        echo ""
+        echo -e "${BOLD}=== Images ===${RESET}"
+
+        local script_ver
+        script_ver=$(get_version)
+
+        if container_image_exists 2>/dev/null; then
+            local c_ver
+            c_ver=$(incus image get-property "${CONTAINER_IMAGE_ALIAS}" user.coding-sandbox-version 2>/dev/null) || c_ver="unknown"
+            _doc_info "Container:" "${CONTAINER_IMAGE_ALIAS}"
+            if [[ "$c_ver" == "$script_ver" ]]; then
+                _doc_ok "  Version:" "${c_ver}"
+            else
+                _doc_warn "  Version:" "${c_ver} (script: ${script_ver}) — rebuild recommended"
+            fi
+        else
+            if image_artifacts_exist 2>/dev/null; then
+                _doc_info "Container:" "not imported — artifacts available"
+            else
+                _doc_info "Container:" "not available — run 'sudo coding-sandbox build'"
+            fi
+        fi
+
+        if image_exists 2>/dev/null; then
+            local v_ver
+            v_ver=$(incus image get-property "${IMAGE_ALIAS}" user.coding-sandbox-version 2>/dev/null) || v_ver="unknown"
+            _doc_info "VM:" "${IMAGE_ALIAS}"
+            if [[ "$v_ver" == "$script_ver" ]]; then
+                _doc_ok "  Version:" "${v_ver}"
+            else
+                _doc_warn "  Version:" "${v_ver} (script: ${script_ver}) — rebuild recommended"
+            fi
+        else
+            if vm_artifacts_exist 2>/dev/null; then
+                _doc_info "VM:" "not imported — artifacts available"
+            else
+                _doc_info "VM:" "not available — run 'sudo coding-sandbox build'"
+            fi
+        fi
+    fi
+
+    echo ""
+    echo -e "${BOLD}=== Build Artifacts ===${RESET}"
+
+    if image_artifacts_exist 2>/dev/null; then
+        local c_size
+        c_size=$(du -sh "${BUILD_DIR}/container.incus.tar.xz" 2>/dev/null | cut -f1) || c_size="?"
+        _doc_ok "Container:" "present (${c_size})"
+    else
+        _doc_info "Container:" "not found"
+    fi
+
+    if vm_artifacts_exist 2>/dev/null; then
+        local v_size
+        v_size=$(du -sh "${BUILD_DIR}/vm.disk.qcow2" 2>/dev/null | cut -f1) || v_size="?"
+        _doc_ok "VM:" "present (${v_size})"
+    else
+        _doc_info "VM:" "not found"
+    fi
+
+    echo ""
+    echo -e "${BOLD}=== Summary ===${RESET}"
+    echo "  ${checks_ok} checks passed, ${checks_warn} warning(s), ${checks_err} error(s)"
+    echo ""
+
+    (( checks_err == 0 ))
+}
+
+cmd_version() {
+    get_version
+}
+
+cmd_help() {
+    cat << EOF
+
+${BOLD}coding-sandbox${RESET} — Incus sandbox for AI coding tools (Debian 13)
+
+${BOLD}Usage:${RESET}
+  $(basename "$0") [command] [--vm]
+
+${BOLD}Commands:${RESET}
+  shell       Interactive shell ${CYAN}(default)${RESET}
+  build       Build container and VM images (skips if already built)
+  rebuild     Fresh build: removes old images, rebuilds, and makes them available
+  destroy     Remove VM and images
+  status      Show instance and image status
+  doctor      System diagnostics and dependency check
+  help        Show this help
+
+${BOLD}Commands only for VM (use with --vm):${RESET}
+  start       Start VM
+  stop        Stop VM
+  update      Update packages and tools in VM
+
+${BOLD}Options:${RESET}
+  --vm        Use VM mode instead of container (persistent environment)
+  --yes, -y   Skip confirmation prompts (for scripting)
+  --purge     With destroy/rebuild: also delete cached rootfs and build files
+
+${BOLD}Quickstart:${RESET}
+  $(basename "$0")                 # launch a container shell (auto-builds if needed)
+  $(basename "$0") --vm shell      # launch a VM shell
+
+${BOLD}Container mode${RESET} (default):
+  Ephemeral container that mounts \$PWD from the host. Destroyed on exit.
+  Credentials persist in ${HOST_HOME}.
+
+${BOLD}VM mode${RESET} (--vm):
+  Persistent VM — files, tools, and config survive across reboots.
+  Clone projects inside the VM and work there directly.
+
+${BOLD}Environment:${RESET}
+  CODING_SANDBOX_VM               VM name                     [${VM_NAME}]
+  CODING_SANDBOX_IMAGE            VM image alias              [${IMAGE_ALIAS}]
+  CODING_SANDBOX_CONTAINER_IMAGE  Container image alias       [${CONTAINER_IMAGE_ALIAS}]
+  CODING_SANDBOX_BUILDDIR         Build directory             [${BUILD_DIR}]
+  CODING_SANDBOX_USER             User inside VM/container    [${SHELL_USER}]
+  CODING_SANDBOX_CPU              VM vCPU count               [${VM_CPU}]
+  CODING_SANDBOX_RAM              VM RAM allocation           [${VM_RAM}]
+  CODING_SANDBOX_DISK             VM root disk size           [${VM_DISK}]
+  CODING_SANDBOX_HOME             Container persistent home   [${HOST_HOME}]
+
+EOF
+}
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+main() {
+    local cmd=""
+    local dry_run=false
+    _force_yes=false
+    _purge=false
+
+    for arg in "$@"; do
+        case "$arg" in
+            --vm)      MODE="vm" ;;
+            --dry-run) dry_run=true ;;
+            --yes|-y)  _force_yes=true ;;
+            --purge)   _purge=true ;;
+            -h|--help)    cmd="help" ;;
+            --version)    cmd="version" ;;
+            -*)           die "Unknown option: $arg" ;;
+            *)
+                [[ -z "$cmd" ]] || die "Unexpected argument: $arg"
+                cmd="$arg"
+                ;;
+        esac
+    done
+
+    cmd="${cmd:-shell}"
+
+    # Validate command
+    case "$cmd" in
+        build|start|shell|stop|destroy|rebuild|status|update|doctor|version|help) ;;
+        *) die "Unknown command: '$cmd'\nRun '$(basename "$0") help' for usage." ;;
+    esac
+
+    # --purge only valid with destroy/rebuild
+    if [[ "$_purge" == true && "$cmd" != "destroy" && "$cmd" != "rebuild" ]]; then
+        die "--purge is only valid with 'destroy' or 'rebuild'"
+    fi
+
+    # start/stop imply VM mode
+    [[ "$cmd" == "start" || "$cmd" == "stop" ]] && MODE="vm"
+
+    if [[ "$dry_run" == true ]]; then
+        local dry_info="cmd=${cmd} mode=${MODE}"
+        [[ "$cmd" == "destroy" || "$cmd" == "rebuild" ]] && dry_info+=" purge=${_purge}"
+        [[ "$cmd" == "build" || "$cmd" == "rebuild" ]] && dry_info+=" tools=${CODING_SANDBOX_TOOLS}"
+        # For shell/tool commands, report whether auto-build would trigger
+        case "$cmd" in
+            shell)
+                local auto_build=false
+                if command -v incus &>/dev/null; then
+                    if [[ "$MODE" == "vm" ]]; then
+                        image_exists 2>/dev/null || auto_build=true
+                    else
+                        container_image_exists 2>/dev/null || auto_build=true
+                    fi
+                fi
+                dry_info+=" auto_build=${auto_build}"
+                ;;
+        esac
+        echo "$dry_info"
+        return 0
+    fi
+
+    [[ "$cmd" != "help" && "$cmd" != "version" && "$cmd" != "doctor" ]] && check_deps "$cmd"
+
+    case "$cmd" in
+        build)    cmd_build ;;
+        start)    cmd_start ;;
+        shell)    cmd_shell ;;
+        stop)     cmd_stop ;;
+        destroy)  cmd_destroy ;;
+        rebuild)  cmd_rebuild ;;
+        status)   cmd_status ;;
+        update)   cmd_update ;;
+        doctor)   cmd_doctor ;;
+        version)  cmd_version ;;
+        help)     cmd_help ;;
+        *)        die "Unknown command: '$cmd'\nRun '$(basename "$0") help' for usage." ;;
+    esac
+}
+
+main "$@"
