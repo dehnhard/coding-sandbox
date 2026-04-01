@@ -23,7 +23,7 @@ Three modes of operation via two scripts:
   - Ephemeral container that mounts your current directory from the host.
   - The configuration (the sandbox users home directory) is stored in the host users `~/.quick-coding-sandbox` directory.
 
-- AI Coding tools
+- AI Coding tools (the unified installation scripts for these tools are in the `tools` subdirectory)
   - [Claude Code](https://claude.ai) (default)
   - [OpenCode](https://github.com/anomalyco/opencode)
   - [Crush](https://github.com/charmbracelet/crush)
